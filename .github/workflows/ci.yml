@@ -3,6 +3,20 @@ name: CI
 
 on:
   workflow_dispatch:
+    inputs:
+      leg:
+        description: "baseline (uninstrumented) or instrumented (under chalk/curiosity)"
+        type: choice
+        options: [instrumented, baseline]
+        default: instrumented
+      profile:
+        description: "CrashOverride chalk profile"
+        type: string
+        default: curiosity-tests-racecar
+      racecar_run:
+        description: "racecar correlation token, echoed into the run name"
+        type: string
+        default: ""
   pull_request:
     types: [opened, synchronize, reopened, ready_for_review]
     paths:
@@ -52,8 +66,19 @@ on:
       - ".github/workflows/**"
 
 concurrency:
-  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
-  cancel-in-progress: true
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}-${{ inputs.leg || 'push' }}-${{ inputs.racecar_run }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+  id-token: write
+
+env:
+  # The one variable that separates the arms: on baseline, action-checkout
+  # skips its Set up Chalk step entirely.
+  CHALK_ON: ${{ github.event_name == 'workflow_dispatch' && inputs.leg != 'baseline' }}
+
+run-name: "CI ${{ inputs.leg || 'push' }} ${{ inputs.racecar_run }}"
 
 jobs:
   changes:
@@ -62,6 +87,7 @@ jobs:
     permissions:
       contents: read
       pull-requests: read
+      id-token: write
     outputs:
       linux: ${{ github.event_name == 'workflow_dispatch' || github.event_name == 'push' || steps.filter.outputs.engine == 'true' || steps.filter.outputs.shared_datapack == 'true' || steps.filter.outputs.canary_datapack == 'true' || steps.filter.outputs.global_datapack == 'true' }}
       full_matrix: ${{ github.event_name == 'workflow_dispatch' || github.event_name == 'push' || steps.filter.outputs.engine == 'true' }}
@@ -71,9 +97,18 @@ jobs:
       docker_quickstart: ${{ github.event_name == 'workflow_dispatch' && 'true' || steps.filter.outputs.docker_quickstart }}
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v6
+        uses: crashappsec/action-checkout@main
         with:
+          chalk: ${{ env.CHALK_ON }}
+          profile: ${{ inputs.profile || 'curiosity-tests-racecar' }}
+          observables_continue_on_error: false
+          lfs: false
           fetch-depth: 0
+      - name: Assert instrumentation is live
+        if: env.CHALK_ON == 'true'
+        run: |
+          test -n "${CURIOSITY_ROOT:-}" || { echo "::error::CURIOSITY_ROOT unset - observables never installed"; exit 1; }
+          test -S "${CURIOSITY_SOCKET_NAME:?socket name unset}" || { echo "::error::co-hostd socket absent"; exit 1; }
 
       - name: Detect changed paths
         id: filter
@@ -138,7 +173,12 @@ jobs:
     permissions:
       contents: write
       checks: write
+      id-token: write
     uses: ./.github/workflows/reusable-checks.yml
+    with:
+      chalk_on: ${{ github.event_name == 'workflow_dispatch' && inputs.leg != 'baseline' }}
+      profile: ${{ inputs.profile || 'curiosity-tests-racecar' }}
+      racecar_run: ${{ inputs.racecar_run }}
     secrets: inherit
 
   tests-lua:
@@ -146,7 +186,12 @@ jobs:
     if: github.event_name == 'push' || github.event_name == 'workflow_dispatch' || github.event.pull_request.draft == false
     permissions:
       contents: read
+      id-token: write
     uses: ./.github/workflows/reusable-tests-lua.yml
+    with:
+      chalk_on: ${{ github.event_name == 'workflow_dispatch' && inputs.leg != 'baseline' }}
+      profile: ${{ inputs.profile || 'curiosity-tests-racecar' }}
+      racecar_run: ${{ inputs.racecar_run }}
     secrets: inherit
 
   # --- Heavy Builds ---
@@ -158,35 +203,15 @@ jobs:
     permissions:
       contents: write
       packages: write
+      id-token: write
     uses: ./.github/workflows/reusable-build-linux.yml
     with:
+      chalk_on: ${{ github.event_name == 'workflow_dispatch' && inputs.leg != 'baseline' }}
+      profile: ${{ inputs.profile || 'curiosity-tests-racecar' }}
+      racecar_run: ${{ inputs.racecar_run }}
       buildtypes: ${{ needs.changes.outputs.full_matrix == 'true' && '["linux-release","linux-debug"]' || '["linux-release"]' }}
       run_canary_smoke: ${{ needs.changes.outputs.run_canary_smoke == 'true' }}
       run_global_smoke: ${{ needs.changes.outputs.run_global_smoke == 'true' }}
-    secrets: inherit
-
-  build-windows:
-    name: Build - Windows
-    needs: [changes, checks, tests-lua]
-    if: needs.changes.outputs.full_matrix == 'true' && needs.checks.result == 'success' && needs.tests-lua.result == 'success' && (github.event_name == 'push' || github.event_name == 'workflow_dispatch' || github.event.pull_request.draft == false)
-    permissions:
-      contents: read
-      packages: write
-    uses: ./.github/workflows/reusable-build-windows.yml
-    with:
-      run_canary_smoke: ${{ needs.changes.outputs.run_canary_smoke == 'true' }}
-    secrets: inherit
-
-  build-macos:
-    name: Build - macOS
-    needs: [changes, checks, tests-lua]
-    if: needs.changes.outputs.full_matrix == 'true' && needs.checks.result == 'success' && needs.tests-lua.result == 'success' && (github.event_name == 'push' || github.event_name == 'workflow_dispatch' || github.event.pull_request.draft == false)
-    permissions:
-      contents: read
-      packages: write
-    uses: ./.github/workflows/reusable-build-macos.yml
-    with:
-      run_canary_smoke: ${{ needs.changes.outputs.run_canary_smoke == 'true' }}
     secrets: inherit
 
   build-docker:
@@ -196,7 +221,12 @@ jobs:
     permissions:
       contents: read
       packages: write
+      id-token: write
     uses: ./.github/workflows/reusable-build-docker.yml
+    with:
+      chalk_on: ${{ github.event_name == 'workflow_dispatch' && inputs.leg != 'baseline' }}
+      profile: ${{ inputs.profile || 'curiosity-tests-racecar' }}
+      racecar_run: ${{ inputs.racecar_run }}
     secrets: inherit
 
   docker-quickstart-smoke:
@@ -205,4 +235,9 @@ jobs:
     if: (needs.changes.outputs.docker == 'true' || needs.changes.outputs.docker_quickstart == 'true') && needs.checks.result == 'success' && needs.tests-lua.result == 'success' && needs.build-docker.result == 'success' && (github.event_name == 'push' || github.event_name == 'workflow_dispatch' || !github.event.pull_request.draft)
     permissions:
       contents: read
+      id-token: write
     uses: ./.github/workflows/reusable-docker-quickstart-smoke.yml
+    with:
+      chalk_on: ${{ github.event_name == 'workflow_dispatch' && inputs.leg != 'baseline' }}
+      profile: ${{ inputs.profile || 'curiosity-tests-racecar' }}
+      racecar_run: ${{ inputs.racecar_run }}
